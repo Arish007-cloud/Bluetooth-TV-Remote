@@ -62,13 +62,17 @@ object HidKeys {
     const val KEY_UP = 0x52
     const val MOD_LEFT_SHIFT = 0x02
 
+    const val MOD_LEFT_GUI = 0x08 // Meta
+    const val KEY_Y = 0x1C
+
     /**
-     * Google TV has no standard key that opens YouTube (the Haier remote's
-     * button is a Haier-only code). The YouTube key sends F12, which the TV
+     * Google TV has no standard key that opens an app (the Haier remote's
+     * app buttons are Haier-only codes). Each app key sends an F-key the TV
      * ignores by default, and a key-mapping app on the TV turns it into
-     * "open YouTube". See README.
+     * "open this app". See README.
      */
     const val KEY_YOUTUBE = 0x45 // F12
+    const val KEY_TAMASHA = 0x44 // F11
 
     // Consumer usages, with the Android key each one becomes on the TV
     const val POWER = 0x030          // POWER

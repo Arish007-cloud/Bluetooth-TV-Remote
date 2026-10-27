@@ -7,7 +7,11 @@ import android.bluetooth.BluetoothHidDevice
 import android.bluetooth.BluetoothHidDeviceAppSdpSettings
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import java.util.concurrent.Executors
@@ -16,11 +20,16 @@ import java.util.concurrent.Executors
  * Makes the phone a Bluetooth keyboard + media remote (HID device profile).
  * Needs only Bluetooth: WiFi on or off makes no difference.
  *
- * Every call that touches Bluetooth assumes the runtime permissions were
- * already granted by MainActivity.
+ * Once a TV has been connected, it is remembered and the remote keeps trying
+ * to reconnect whenever the link drops (TV in standby, unplugged and plugged
+ * back in, out of range), until the user disconnects on purpose.
+ *
+ * One shared instance ([get]) is kept alive by [RemoteService], so the link
+ * survives the app going to the background. Every call that touches
+ * Bluetooth assumes the runtime permissions were already granted.
  */
 @SuppressLint("MissingPermission")
-class HidRemote(context: Context, private val listener: Listener) {
+class HidRemote private constructor(context: Context) {
 
     interface Listener {
         fun onStatus(status: Status, device: BluetoothDevice?)
@@ -28,32 +37,68 @@ class HidRemote(context: Context, private val listener: Listener) {
 
     enum class Status { UNSUPPORTED, BLUETOOTH_OFF, STARTING, READY, CONNECTING, CONNECTED }
 
+    companion object {
+        /** Seconds between reconnect attempts while the TV is away: quick at first, then every 15 s. */
+        private val RETRY_DELAYS_MS = longArrayOf(2_000, 4_000, 8_000, 15_000)
+
+        @Volatile private var instance: HidRemote? = null
+
+        fun get(context: Context): HidRemote =
+            instance ?: synchronized(this) {
+                instance ?: HidRemote(context).also { instance = it }
+            }
+    }
+
     private val appContext = context.applicationContext
     private val adapter: BluetoothAdapter? =
         (appContext.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
     private val prefs = appContext.getSharedPreferences("remote", Context.MODE_PRIVATE)
     private val main = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
+    private val listeners = mutableSetOf<Listener>()
 
     private var hid: BluetoothHidDevice? = null
     private var registered = false
     private var pendingConnect: BluetoothDevice? = null
+    private var retryCount = 0
+    private var stateReceiverRegistered = false
+
+    var status = Status.STARTING
+        private set
+    var statusDevice: BluetoothDevice? = null
+        private set
 
     var connectedDevice: BluetoothDevice? = null
         private set
 
     val isConnected get() = connectedDevice != null
 
-    /** The last TV we were connected to, so the app reconnects by itself. */
+    /** The TV to stay connected to. Cleared only when the user disconnects. */
     private var savedAddress: String?
         get() = prefs.getString("device", null)
         set(value) = prefs.edit().putString("device", value).apply()
 
+    val savedDevice: BluetoothDevice?
+        get() = savedAddress?.let { addr -> runCatching { adapter?.getRemoteDevice(addr) }.getOrNull() }
+
+    fun addListener(l: Listener) {
+        listeners.add(l)
+        l.onStatus(status, statusDevice)
+    }
+
+    fun removeListener(l: Listener) {
+        listeners.remove(l)
+    }
+
     fun start() {
+        watchBluetoothState()
         val bt = adapter
         if (bt == null) return post(Status.UNSUPPORTED)
         if (!bt.isEnabled) return post(Status.BLUETOOTH_OFF)
-        if (hid != null) return
+        if (hid != null) {
+            if (registered && !isConnected) reconnectNow()
+            return
+        }
         post(Status.STARTING)
         val ok = bt.getProfileProxy(appContext, object : BluetoothProfile.ServiceListener {
             override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
@@ -72,6 +117,7 @@ class HidRemote(context: Context, private val listener: Listener) {
     }
 
     fun stop() {
+        cancelRetry()
         hid?.let {
             connectedDevice?.let { d -> it.disconnect(d) }
             it.unregisterApp()
@@ -80,6 +126,10 @@ class HidRemote(context: Context, private val listener: Listener) {
         hid = null
         registered = false
         connectedDevice = null
+        if (stateReceiverRegistered) {
+            runCatching { appContext.unregisterReceiver(bluetoothStateReceiver) }
+            stateReceiverRegistered = false
+        }
     }
 
     private fun register() {
@@ -94,9 +144,11 @@ class HidRemote(context: Context, private val listener: Listener) {
         if (!ok) post(Status.UNSUPPORTED)
     }
 
-    /** Connect to a TV. If it isn't paired yet, Android pairs it first. */
+    /** Connect to a TV and remember it. If it isn't paired yet, Android pairs it first. */
     fun connect(device: BluetoothDevice) {
         savedAddress = device.address
+        retryCount = 0
+        cancelRetry()
         adapter?.cancelDiscovery()
         val h = hid
         if (h == null || !registered) {
@@ -109,8 +161,10 @@ class HidRemote(context: Context, private val listener: Listener) {
         h.connect(device)
     }
 
+    /** Disconnect on purpose: forget the TV so the remote stops reconnecting. */
     fun disconnect() {
         savedAddress = null
+        cancelRetry()
         connectedDevice?.let { hid?.disconnect(it) }
     }
 
@@ -118,6 +172,61 @@ class HidRemote(context: Context, private val listener: Listener) {
         adapter?.bondedDevices?.sortedBy { it.name ?: it.address } ?: emptyList()
 
     fun deviceName(device: BluetoothDevice): String = device.name ?: device.address
+
+    // --- Staying connected ---
+
+    private val retryRunnable = Runnable { reconnectNow() }
+
+    private fun reconnectNow() {
+        val h = hid ?: return
+        val target = savedDevice ?: return
+        if (!registered || isConnected) return
+        post(Status.CONNECTING, target)
+        h.connect(target)
+        // If this attempt doesn't connect, try again later.
+        scheduleRetry()
+    }
+
+    private fun scheduleRetry() {
+        if (savedAddress == null) return
+        main.removeCallbacks(retryRunnable)
+        val delay = RETRY_DELAYS_MS[minOf(retryCount, RETRY_DELAYS_MS.size - 1)]
+        retryCount++
+        main.postDelayed(retryRunnable, delay)
+    }
+
+    private fun cancelRetry() {
+        main.removeCallbacks(retryRunnable)
+    }
+
+    /** Restart cleanly when the phone's Bluetooth is turned off and on again. */
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)) {
+                BluetoothAdapter.STATE_ON -> {
+                    hid = null
+                    registered = false
+                    start()
+                }
+                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
+                    cancelRetry()
+                    connectedDevice = null
+                    post(Status.BLUETOOTH_OFF)
+                }
+            }
+        }
+    }
+
+    private fun watchBluetoothState() {
+        if (stateReceiverRegistered) return
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            appContext.registerReceiver(bluetoothStateReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            appContext.registerReceiver(bluetoothStateReceiver, filter)
+        }
+        stateReceiverRegistered = true
+    }
 
     // --- Sending keys ---
 
@@ -144,9 +253,9 @@ class HidRemote(context: Context, private val listener: Listener) {
         }
     }
 
-    fun tapKeyboard(usage: Int) {
+    fun tapKeyboard(usage: Int, modifiers: Int = 0) {
         executor.execute {
-            keyboardDown(usage)
+            keyboardDown(usage, modifiers)
             Thread.sleep(15)
             keyboardUp()
         }
@@ -168,12 +277,14 @@ class HidRemote(context: Context, private val listener: Listener) {
                 return
             }
             post(Status.READY)
-            val target = pendingConnect ?: pluggedDevice
-                ?: savedAddress?.let { addr -> bondedDevices().firstOrNull { it.address == addr } }
+            val target = pendingConnect ?: pluggedDevice ?: savedDevice
             pendingConnect = null
             if (target != null) {
-                post(Status.CONNECTING, target)
-                hid?.connect(target)
+                main.post {
+                    savedAddress = target.address
+                    retryCount = 0
+                    reconnectNow()
+                }
             }
         }
 
@@ -182,13 +293,26 @@ class HidRemote(context: Context, private val listener: Listener) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     connectedDevice = device
                     savedAddress = device.address
+                    main.post {
+                        retryCount = 0
+                        cancelRetry()
+                    }
                     post(Status.CONNECTED, device)
                 }
                 BluetoothProfile.STATE_CONNECTING -> post(Status.CONNECTING, device)
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     if (connectedDevice?.address == device.address || connectedDevice == null) {
                         connectedDevice = null
-                        post(Status.READY)
+                        if (savedAddress == device.address) {
+                            // The TV went away (standby, power cut): keep trying until it's back.
+                            post(Status.CONNECTING, device)
+                            main.post {
+                                retryCount = 0
+                                scheduleRetry()
+                            }
+                        } else {
+                            post(Status.READY)
+                        }
                     }
                 }
             }
@@ -205,6 +329,10 @@ class HidRemote(context: Context, private val listener: Listener) {
     }
 
     private fun post(status: Status, device: BluetoothDevice? = null) {
-        main.post { listener.onStatus(status, device) }
+        main.post {
+            this.status = status
+            this.statusDevice = device
+            listeners.toList().forEach { it.onStatus(status, device) }
+        }
     }
 }

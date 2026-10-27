@@ -59,13 +59,15 @@ class MainActivity : Activity(), HidRemote.Listener {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.statusBarColor = BACKGROUND
         window.navigationBarColor = BACKGROUND
-        remote = HidRemote(this, this)
+        remote = HidRemote.get(this)
         setContentView(buildScreen())
+        remote.addListener(this)
         startWhenAllowed()
     }
 
     override fun onDestroy() {
-        remote.stop()
+        // The connection lives on in RemoteService; only stop listening here.
+        remote.removeListener(this)
         super.onDestroy()
     }
 
@@ -84,7 +86,10 @@ class MainActivity : Activity(), HidRemote.Listener {
 
     private fun startWhenAllowed() {
         if (!hasPermissions()) {
-            requestPermissions(neededPermissions(), REQUEST_PERMISSIONS)
+            val ask = neededPermissions().toMutableList()
+            // Optional: lets the "Connected to TV" notification show.
+            if (Build.VERSION.SDK_INT >= 33) ask.add(Manifest.permission.POST_NOTIFICATIONS)
+            requestPermissions(ask.toTypedArray(), REQUEST_PERMISSIONS)
             return
         }
         val bt = bluetoothAdapter
@@ -93,7 +98,7 @@ class MainActivity : Activity(), HidRemote.Listener {
             startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), REQUEST_ENABLE_BT)
             return
         }
-        remote.start()
+        RemoteService.start(this)
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, results: IntArray) {
@@ -112,7 +117,7 @@ class MainActivity : Activity(), HidRemote.Listener {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_ENABLE_BT) {
-            if (bluetoothAdapter?.isEnabled == true) remote.start() else onStatus(HidRemote.Status.BLUETOOTH_OFF, null)
+            if (bluetoothAdapter?.isEnabled == true) RemoteService.start(this) else onStatus(HidRemote.Status.BLUETOOTH_OFF, null)
         }
     }
 
@@ -127,7 +132,7 @@ class MainActivity : Activity(), HidRemote.Listener {
             HidRemote.Status.BLUETOOTH_OFF -> showStatus(false, "Bluetooth is off")
             HidRemote.Status.STARTING -> showStatus(false, "Starting Bluetooth…")
             HidRemote.Status.READY -> showStatus(false, "Not connected")
-            HidRemote.Status.CONNECTING -> showStatus(false, "Connecting to $name…")
+            HidRemote.Status.CONNECTING -> showStatus(false, "Waiting for $name…")
             HidRemote.Status.CONNECTED -> showStatus(true, "Connected to $name")
         }
         connectButton.text = when (status) {
@@ -366,6 +371,14 @@ class MainActivity : Activity(), HidRemote.Listener {
         body.addView(pill(
             RemoteKey(this, Icon.YOUTUBE, label = "YouTube", flat = true).apply {
                 onPress = { if (checkConnected()) remote.keyboardDown(HidKeys.KEY_YOUTUBE) }
+                onRelease = {
+                    remote.keyboardUp()
+                    // Meta+Y is Android's own "open YouTube" shortcut; some TVs honour it with no setup.
+                    remote.tapKeyboard(HidKeys.KEY_Y, HidKeys.MOD_LEFT_GUI)
+                }
+            },
+            RemoteKey(this, Icon.TEXT, label = "Tamasha", flat = true).apply {
+                onPress = { if (checkConnected()) remote.keyboardDown(HidKeys.KEY_TAMASHA) }
                 onRelease = { remote.keyboardUp() }
             }
         ))
